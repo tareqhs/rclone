@@ -1589,21 +1589,22 @@ type Options struct {
 
 // Fs represents a remote s3 server
 type Fs struct {
-	name          string          // the name of the remote
-	root          string          // root of the bucket - ignore all objects above this
-	opt           Options         // parsed options
-	ci            *fs.ConfigInfo  // global config
-	ctx           context.Context // global context for reading config
-	features      *fs.Features    // optional features
-	c             *s3.Client      // the connection to the s3 server
-	rootBucket    string          // bucket part of root (if any)
-	rootDirectory string          // directory part of root (if any)
-	cache         *bucket.Cache   // cache for bucket creation status
-	pacer         *fs.Pacer       // To pace the API calls
-	srv           *http.Client    // a plain http client
-	srvRest       *rest.Client    // the rest connection to the server
-	pool          *pool.Pool      // memory pool
-	etagIsNotMD5  bool            // if set ETags are not MD5s
+	name          string            // the name of the remote
+	root          string            // root of the bucket - ignore all objects above this
+	opt           Options           // parsed options
+	ci            *fs.ConfigInfo    // global config
+	ctx           context.Context   // global context for reading config
+	features      *fs.Features      // optional features
+	c             *s3.Client        // the connection to the s3 server
+	presigner     *s3.PresignClient // client for pre-signing requests
+	rootBucket    string            // bucket part of root (if any)
+	rootDirectory string            // directory part of root (if any)
+	cache         *bucket.Cache     // cache for bucket creation status
+	pacer         *fs.Pacer         // To pace the API calls
+	srv           *http.Client      // a plain http client
+	srvRest       *rest.Client      // the rest connection to the server
+	pool          *pool.Pool        // memory pool
+	etagIsNotMD5  bool              // if set ETags are not MD5s
 }
 
 // Object describes a s3 object
@@ -1612,14 +1613,14 @@ type Object struct {
 	//
 	// List will read everything but meta & mimeType - to fill
 	// that in you need to call readMetaData
-	fs           *Fs                // what this object is part of
-	remote       string             // The remote path
-	md5          string             // md5sum of the object
-	bytes        int64              // size of the object
-	lastModified time.Time          // Last modified
-	meta         map[string]*string // The object metadata if known - may be nil
-	mimeType     string             // MimeType of object - may be ""
-	storageClass string             // e.g. GLACIER
+	fs           *Fs               // what this object is part of
+	remote       string            // The remote path
+	md5          string            // md5sum of the object
+	bytes        int64             // size of the object
+	lastModified time.Time         // Last modified
+	meta         map[string]string // The object metadata if known - may be nil
+	mimeType     string            // MimeType of object - may be ""
+	storageClass string            // e.g. GLACIER
 }
 
 // ------------------------------------------------------------
@@ -2138,6 +2139,7 @@ func (f *Fs) updateRegionForBucket(ctx context.Context, bucket string) error {
 		return fmt.Errorf("creating new session failed: %w", err)
 	}
 	f.c = c
+	f.presigner = s3.NewPresignClient(f.c)
 
 	fs.Logf(f, "Switched region to %q from %q", region, oldRegion)
 	return nil
@@ -2192,10 +2194,10 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 			StartAfter:        startAfter,
 		}
 		if urlEncodeListings {
-			req.EncodingType = aws.String(s3.EncodingTypeUrl)
+			req.EncodingType = types.EncodingTypeUrl
 		}
 		if f.opt.RequesterPays {
-			req.RequestPayer = aws.String(s3.RequestPayerRequester)
+			req.RequestPayer = types.RequestPayerRequester
 		}
 		var resp *s3.ListObjectsV2Output
 		var err error
@@ -2225,7 +2227,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 						if _, ok := origErr.(*xml.SyntaxError); ok {
 							// Retry the listing with URL encoding as there were characters that XML can't encode
 							urlEncodeListings = true
-							req.EncodingType = aws.String(s3.EncodingTypeUrl)
+							req.EncodingType = types.EncodingTypeUrl
 							fs.Debugf(f, "Retrying listing because of characters which can't be XML encoded")
 							return true, err
 						}
@@ -2286,11 +2288,11 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 			}
 		}
 		for _, object := range resp.Contents {
-			remote := aws.StringValue(object.Key)
+			remote := *object.Key
 			if urlEncodeListings {
 				remote, err = url.QueryUnescape(remote)
 				if err != nil {
-					fs.Logf(f, "failed to URL decode %q in listing: %v", aws.StringValue(object.Key), err)
+					fs.Logf(f, "failed to URL decode %q in listing: %v", *object.Key, err)
 					continue
 				}
 			}
@@ -2305,15 +2307,15 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 				remote = path.Join(bucket, remote)
 			}
 			// is this a directory marker?
-			if isDirectory && object.Size != nil && *object.Size == 0 {
+			if isDirectory && object.Size == 0 {
 				continue // skip directory marker
 			}
-			err = fn(remote, object, false)
+			err = fn(remote, &object, false)
 			if err != nil {
 				return err
 			}
 		}
-		if !aws.BoolValue(resp.IsTruncated) {
+		if !resp.IsTruncated {
 			break
 		}
 		// Use NextContinuationToken if set, otherwise use last Key for StartAfter
@@ -2340,10 +2342,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 // Convert a list item into a DirEntry
 func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *types.Object, isDirectory bool) (fs.DirEntry, error) {
 	if isDirectory {
-		size := int64(0)
-		if object.Size != nil {
-			size = *object.Size
-		}
+		size := object.Size
 		d := fs.NewDir(remote, time.Time{}).SetSize(size)
 		return d, nil
 	}
@@ -2387,9 +2386,9 @@ func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error)
 		return nil, err
 	}
 	for _, bucket := range resp.Buckets {
-		bucketName := f.opt.Enc.ToStandardName(aws.StringValue(bucket.Name))
+		bucketName := f.opt.Enc.ToStandardName(*bucket.Name)
 		f.cache.MarkOK(bucketName)
-		d := fs.NewDir(bucketName, aws.TimeValue(bucket.CreationDate))
+		d := fs.NewDir(bucketName, *bucket.CreationDate)
 		entries = append(entries, d)
 	}
 	return entries, nil
@@ -2523,11 +2522,11 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) error {
 	return f.cache.Create(bucket, func() error {
 		req := s3.CreateBucketInput{
 			Bucket: &bucket,
-			ACL:    &f.opt.BucketACL,
+			ACL:    types.BucketCannedACL(f.opt.BucketACL),
 		}
 		if f.opt.LocationConstraint != "" {
-			req.CreateBucketConfiguration = &s3.CreateBucketConfiguration{
-				LocationConstraint: &f.opt.LocationConstraint,
+			req.CreateBucketConfiguration = &types.CreateBucketConfiguration{
+				LocationConstraint: types.BucketLocationConstraint(f.opt.LocationConstraint),
 			}
 		}
 		err := f.pacer.Call(func() (bool, error) {
@@ -2588,15 +2587,15 @@ func pathEscape(s string) string {
 // method
 func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPath, srcBucket, srcPath string, src *Object) error {
 	req.Bucket = &dstBucket
-	req.ACL = &f.opt.ACL
+	req.ACL = types.ObjectCannedACL(f.opt.ACL)
 	req.Key = &dstPath
 	source := pathEscape(path.Join(srcBucket, srcPath))
 	req.CopySource = &source
 	if f.opt.RequesterPays {
-		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+		req.RequestPayer = types.RequestPayerRequester
 	}
 	if f.opt.ServerSideEncryption != "" {
-		req.ServerSideEncryption = &f.opt.ServerSideEncryption
+		req.ServerSideEncryption = types.ServerSideEncryption(f.opt.ServerSideEncryption)
 	}
 	if f.opt.SSECustomerAlgorithm != "" {
 		req.SSECustomerAlgorithm = &f.opt.SSECustomerAlgorithm
@@ -2613,8 +2612,8 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 	if f.opt.SSEKMSKeyID != "" {
 		req.SSEKMSKeyId = &f.opt.SSEKMSKeyID
 	}
-	if req.StorageClass == nil && f.opt.StorageClass != "" {
-		req.StorageClass = &f.opt.StorageClass
+	if req.StorageClass == "" && f.opt.StorageClass != "" {
+		req.StorageClass = types.StorageClass(f.opt.StorageClass)
 	}
 
 	if src.bytes >= int64(f.opt.CopyCutoff) {
@@ -2652,7 +2651,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 
 	// If copy metadata was set then set the Metadata to that read
 	// from the head request
-	if aws.StringValue(copyReq.MetadataDirective) == s3.MetadataDirectiveCopy {
+	if copyReq.MetadataDirective == types.MetadataDirectiveCopy {
 		copyReq.Metadata = info.Metadata
 	}
 
@@ -2692,7 +2691,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 
 	fs.Debugf(src, "Starting  multipart copy with %d parts", numParts)
 
-	var parts []*s3.CompletedPart
+	var parts []types.CompletedPart
 	for partNum := int64(1); partNum <= numParts; partNum++ {
 		if err := f.pacer.Call(func() (bool, error) {
 			partNum := partNum
@@ -2700,15 +2699,15 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 			structs.SetFrom(uploadPartReq, copyReq)
 			uploadPartReq.Bucket = &dstBucket
 			uploadPartReq.Key = &dstPath
-			uploadPartReq.PartNumber = &partNum
+			uploadPartReq.PartNumber = int32(partNum)
 			uploadPartReq.UploadId = uid
 			uploadPartReq.CopySourceRange = aws.String(calculateRange(partSize, partNum-1, numParts, srcSize))
 			uout, err := f.c.UploadPartCopy(ctx, uploadPartReq)
 			if err != nil {
 				return f.shouldRetry(ctx, err)
 			}
-			parts = append(parts, &s3.CompletedPart{
-				PartNumber: &partNum,
+			parts = append(parts, types.CompletedPart{
+				PartNumber: int32(partNum),
 				ETag:       uout.CopyPartResult.ETag,
 			})
 			return false, nil
@@ -2721,7 +2720,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 		_, err := f.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: &dstBucket,
 			Key:    &dstPath,
-			MultipartUpload: &s3.CompletedMultipartUpload{
+			MultipartUpload: &types.CompletedMultipartUpload{
 				Parts: parts,
 			},
 			RequestPayer: req.RequestPayer,
@@ -2753,7 +2752,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	srcBucket, srcPath := srcObj.split()
 	req := s3.CopyObjectInput{
-		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
+		MetadataDirective: types.MetadataDirectiveCopy,
 	}
 	err = f.copy(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj)
 	if err != nil {
@@ -2793,12 +2792,14 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		expire = maxExpireDuration
 	}
 	bucket, bucketPath := f.split(remote)
-	httpReq, _ := f.c.GetObjectRequest(&s3.GetObjectInput{
+	httpReq, err := f.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &bucketPath,
-	})
-
-	return httpReq.Presign(time.Duration(expire))
+	}, s3.WithPresignExpires(time.Duration(expire)))
+	if err != nil {
+		return "", err
+	}
+	return httpReq.URL, nil
 }
 
 var commandHelp = []fs.CommandHelp{{
@@ -2911,18 +2912,18 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		req := s3.RestoreObjectInput{
 			//Bucket:         &f.rootBucket,
 			//Key:            &encodedDirectory,
-			RestoreRequest: &s3.RestoreRequest{},
+			RestoreRequest: &types.RestoreRequest{},
 		}
 		if lifetime := opt["lifetime"]; lifetime != "" {
-			ilifetime, err := strconv.ParseInt(lifetime, 10, 64)
+			ilifetime, err := strconv.ParseInt(lifetime, 10, 32)
 			if err != nil {
 				return nil, fmt.Errorf("bad lifetime: %w", err)
 			}
-			req.RestoreRequest.Days = &ilifetime
+			req.RestoreRequest.Days = int32(ilifetime)
 		}
 		if priority := opt["priority"]; priority != "" {
-			req.RestoreRequest.GlacierJobParameters = &s3.GlacierJobParameters{
-				Tier: &priority,
+			req.RestoreRequest.GlacierJobParameters = &types.GlacierJobParameters{
+				Tier: types.Tier(priority),
 			}
 		}
 		if description := opt["description"]; description != "" {
@@ -2957,7 +2958,7 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			reqCopy.Bucket = &bucket
 			reqCopy.Key = &bucketPath
 			err = f.pacer.Call(func() (bool, error) {
-				_, err = f.c.RestoreObject(&reqCopy)
+				_, err = f.c.RestoreObject(ctx, &reqCopy)
 				return f.shouldRetry(ctx, err)
 			})
 			if err != nil {
@@ -2989,12 +2990,12 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 // Note that rather lazily we treat key as a prefix so it matches
 // directories and objects. This could surprise the user if they ask
 // for "dir" and it returns "dirKey"
-func (f *Fs) listMultipartUploads(ctx context.Context, bucket, key string) (uploads []*s3.MultipartUpload, err error) {
+func (f *Fs) listMultipartUploads(ctx context.Context, bucket, key string) (uploads []types.MultipartUpload, err error) {
 	var (
 		keyMarker      *string
 		uploadIDMarker *string
 	)
-	uploads = []*s3.MultipartUpload{}
+	uploads = []types.MultipartUpload{}
 	for {
 		req := s3.ListMultipartUploadsInput{
 			Bucket:         &bucket,
@@ -3005,14 +3006,14 @@ func (f *Fs) listMultipartUploads(ctx context.Context, bucket, key string) (uplo
 		}
 		var resp *s3.ListMultipartUploadsOutput
 		err = f.pacer.Call(func() (bool, error) {
-			resp, err = f.c.ListMultipartUploads(&req)
+			resp, err = f.c.ListMultipartUploads(ctx, &req)
 			return f.shouldRetry(ctx, err)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("list multipart uploads bucket %q key %q: %w", bucket, key, err)
 		}
 		uploads = append(uploads, resp.Uploads...)
-		if !aws.BoolValue(resp.IsTruncated) {
+		if !resp.IsTruncated {
 			break
 		}
 		keyMarker = resp.NextKeyMarker
@@ -3021,8 +3022,8 @@ func (f *Fs) listMultipartUploads(ctx context.Context, bucket, key string) (uplo
 	return uploads, nil
 }
 
-func (f *Fs) listMultipartUploadsAll(ctx context.Context) (uploadsMap map[string][]*s3.MultipartUpload, err error) {
-	uploadsMap = make(map[string][]*s3.MultipartUpload)
+func (f *Fs) listMultipartUploadsAll(ctx context.Context) (uploadsMap map[string][]types.MultipartUpload, err error) {
+	uploadsMap = make(map[string][]types.MultipartUpload)
 	bucket, directory := f.split("")
 	if bucket != "" {
 		uploads, err := f.listMultipartUploads(ctx, bucket, directory)
@@ -3049,7 +3050,7 @@ func (f *Fs) listMultipartUploadsAll(ctx context.Context) (uploadsMap map[string
 }
 
 // cleanUpBucket removes all pending multipart uploads for a given bucket over the age of maxAge
-func (f *Fs) cleanUpBucket(ctx context.Context, bucket string, maxAge time.Duration, uploads []*s3.MultipartUpload) (err error) {
+func (f *Fs) cleanUpBucket(ctx context.Context, bucket string, maxAge time.Duration, uploads []types.MultipartUpload) (err error) {
 	fs.Infof(f, "cleaning bucket %q of pending multipart uploads older than %v", bucket, maxAge)
 	for _, upload := range uploads {
 		if upload.Initiated != nil && upload.Key != nil && upload.UploadId != nil {
@@ -3065,7 +3066,7 @@ func (f *Fs) cleanUpBucket(ctx context.Context, bucket string, maxAge time.Durat
 					UploadId: upload.UploadId,
 					Key:      upload.Key,
 				}
-				_, abortErr := f.c.AbortMultipartUpload(&req)
+				_, abortErr := f.c.AbortMultipartUpload(ctx, &req)
 				if abortErr != nil {
 					err = fmt.Errorf("failed to remove %s: %w", what, abortErr)
 					fs.Errorf(f, "%v", err)
@@ -3167,7 +3168,7 @@ func (o *Object) headObject(ctx context.Context) (resp *s3.HeadObjectOutput, err
 		Key:    &bucketPath,
 	}
 	if o.fs.opt.RequesterPays {
-		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+		req.RequestPayer = types.RequestPayerRequester
 	}
 	if o.fs.opt.SSECustomerAlgorithm != "" {
 		req.SSECustomerAlgorithm = &o.fs.opt.SSECustomerAlgorithm
@@ -3209,39 +3210,39 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	if resp.LastModified == nil {
 		fs.Logf(o, "Failed to read last modified from HEAD: %v", err)
 	}
-	o.setMetaData(resp.ETag, resp.ContentLength, resp.LastModified, resp.Metadata, resp.ContentType, resp.StorageClass)
+	o.setMetaData(resp.ETag, &resp.ContentLength, resp.LastModified, resp.Metadata, resp.ContentType, string(resp.StorageClass))
 	return nil
 }
 
-func (o *Object) setMetaData(etag *string, contentLength *int64, lastModified *time.Time, meta map[string]*string, mimeType *string, storageClass *string) {
+func (o *Object) setMetaData(etag *string, contentLength *int64, lastModified *time.Time, meta map[string]string, mimeType *string, storageClass string) {
 	// Ignore missing Content-Length assuming it is 0
 	// Some versions of ceph do this due their apache proxies
 	if contentLength != nil {
 		o.bytes = *contentLength
 	}
-	o.setMD5FromEtag(aws.StringValue(etag))
+	o.setMD5FromEtag(*etag)
 	o.meta = meta
 	if o.meta == nil {
-		o.meta = map[string]*string{}
+		o.meta = map[string]string{}
 	}
 	// Read MD5 from metadata if present
 	if md5sumBase64, ok := o.meta[metaMD5Hash]; ok {
-		md5sumBytes, err := base64.StdEncoding.DecodeString(*md5sumBase64)
+		md5sumBytes, err := base64.StdEncoding.DecodeString(md5sumBase64)
 		if err != nil {
-			fs.Debugf(o, "Failed to read md5sum from metadata %q: %v", *md5sumBase64, err)
+			fs.Debugf(o, "Failed to read md5sum from metadata %q: %v", md5sumBase64, err)
 		} else if len(md5sumBytes) != 16 {
-			fs.Debugf(o, "Failed to read md5sum from metadata %q: wrong length", *md5sumBase64)
+			fs.Debugf(o, "Failed to read md5sum from metadata %q: wrong length", md5sumBase64)
 		} else {
 			o.md5 = hex.EncodeToString(md5sumBytes)
 		}
 	}
-	o.storageClass = aws.StringValue(storageClass)
+	o.storageClass = storageClass
 	if lastModified == nil {
 		o.lastModified = time.Now()
 	} else {
 		o.lastModified = *lastModified
 	}
-	o.mimeType = aws.StringValue(mimeType)
+	o.mimeType = *mimeType
 }
 
 // ModTime returns the modification time of the object
@@ -3259,7 +3260,7 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 	}
 	// read mtime out of metadata if available
 	d, ok := o.meta[metaMtime]
-	if !ok || d == nil {
+	if !ok || d == "" {
 		// fs.Debugf(o, "No metadata")
 		return o.lastModified
 	}
@@ -3277,10 +3278,10 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	if err != nil {
 		return err
 	}
-	o.meta[metaMtime] = aws.String(swift.TimeToFloatString(modTime))
+	o.meta[metaMtime] = swift.TimeToFloatString(modTime)
 
 	// Can't update metadata here, so return this error to force a recopy
-	if o.storageClass == "GLACIER" || o.storageClass == "DEEP_ARCHIVE" {
+	if o.storageClass == string(types.StorageClassGlacier) || o.storageClass == string(types.StorageClassDeepArchive) {
 		return fs.ErrorCantSetModTime
 	}
 
@@ -3289,10 +3290,10 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	req := s3.CopyObjectInput{
 		ContentType:       aws.String(fs.MimeType(ctx, o)), // Guess the content type
 		Metadata:          o.meta,
-		MetadataDirective: aws.String(s3.MetadataDirectiveReplace), // replace metadata with that passed in
+		MetadataDirective: types.MetadataDirectiveReplace, // replace metadata with that passed in
 	}
 	if o.fs.opt.RequesterPays {
-		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+		req.RequestPayer = types.RequestPayerRequester
 	}
 	return o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
 }
@@ -3339,11 +3340,11 @@ func (o *Object) downloadFromURL(ctx context.Context, bucketPath string, options
 		fs.Debugf(o, "Failed to parse last modified from string %s, %v", resp.Header.Get("Last-Modified"), err)
 	}
 
-	metaData := make(map[string]*string)
+	metaData := make(map[string]string)
 	for key, value := range resp.Header {
 		if strings.HasPrefix(key, "x-amz-meta") {
 			metaKey := strings.TrimPrefix(key, "x-amz-meta-")
-			metaData[strings.Title(metaKey)] = &value[0]
+			metaData[strings.Title(metaKey)] = value[0]
 		}
 	}
 
@@ -3351,7 +3352,7 @@ func (o *Object) downloadFromURL(ctx context.Context, bucketPath string, options
 	contentType := resp.Header.Get("Content-Type")
 	etag := resp.Header.Get("Etag")
 
-	o.setMetaData(&etag, contentLength, &lastModified, metaData, &contentType, &storageClass)
+	o.setMetaData(&etag, contentLength, &lastModified, metaData, &contentType, storageClass)
 	return resp.Body, err
 }
 
@@ -3368,7 +3369,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		Key:    &bucketPath,
 	}
 	if o.fs.opt.RequesterPays {
-		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+		req.RequestPayer = types.RequestPayerRequester
 	}
 	if o.fs.opt.SSECustomerAlgorithm != "" {
 		req.SSECustomerAlgorithm = &o.fs.opt.SSECustomerAlgorithm
@@ -3508,11 +3509,11 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 		g, gCtx  = errgroup.WithContext(ctx)
 		finished = false
 		partsMu  sync.Mutex // to protect parts
-		parts    []*s3.CompletedPart
+		parts    []types.CompletedPart
 		off      int64
 	)
 
-	for partNum := int64(1); !finished; partNum++ {
+	for partNum := int32(1); !finished; partNum++ {
 		// Get a block of memory from the pool and token which limits concurrency.
 		tokens.Get()
 		buf := memPool.Get()
@@ -3561,10 +3562,10 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 					Body:                 bytes.NewReader(buf),
 					Bucket:               req.Bucket,
 					Key:                  req.Key,
-					PartNumber:           &partNum,
+					PartNumber:           partNum,
 					UploadId:             uid,
 					ContentMD5:           &md5sum,
-					ContentLength:        &partLength,
+					ContentLength:        partLength,
 					RequestPayer:         req.RequestPayer,
 					SSECustomerAlgorithm: req.SSECustomerAlgorithm,
 					SSECustomerKey:       req.SSECustomerKey,
@@ -3572,15 +3573,15 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 				}
 				uout, err := f.c.UploadPart(gCtx, uploadPartReq)
 				if err != nil {
-					if partNum <= int64(concurrency) {
+					if partNum <= int32(concurrency) {
 						return f.shouldRetry(ctx, err)
 					}
 					// retry all chunks once have done the first batch
 					return true, err
 				}
 				partsMu.Lock()
-				parts = append(parts, &s3.CompletedPart{
-					PartNumber: &partNum,
+				parts = append(parts, types.CompletedPart{
+					PartNumber: partNum,
 					ETag:       uout.ETag,
 				})
 				partsMu.Unlock()
@@ -3600,14 +3601,14 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 
 	// sort the completed parts by part number
 	sort.Slice(parts, func(i, j int) bool {
-		return *parts[i].PartNumber < *parts[j].PartNumber
+		return parts[i].PartNumber < parts[j].PartNumber
 	})
 
 	err = f.pacer.Call(func() (bool, error) {
 		_, err := f.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: req.Bucket,
 			Key:    req.Key,
-			MultipartUpload: &s3.CompletedMultipartUpload{
+			MultipartUpload: &types.CompletedMultipartUpload{
 				Parts: parts,
 			},
 			RequestPayer: req.RequestPayer,
@@ -3634,8 +3635,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	multipart := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
 
 	// Set the mtime in the meta data
-	metadata := map[string]*string{
-		metaMtime: aws.String(swift.TimeToFloatString(modTime)),
+	metadata := map[string]string{
+		metaMtime: swift.TimeToFloatString(modTime),
 	}
 
 	// read the md5sum if available
@@ -3656,7 +3657,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 					// - a multipart upload
 					// - the Etag is not an MD5, eg when using SSE/SSE-C
 					// provided checksums aren't disabled
-					metadata[metaMD5Hash] = &md5sum
+					metadata[metaMD5Hash] = md5sum
 				}
 			}
 		}
@@ -3666,7 +3667,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	mimeType := fs.MimeType(ctx, src)
 	req := s3.PutObjectInput{
 		Bucket:      &bucket,
-		ACL:         &o.fs.opt.ACL,
+		ACL:         types.ObjectCannedACL(o.fs.opt.ACL),
 		Key:         &bucketPath,
 		ContentType: &mimeType,
 		Metadata:    metadata,
@@ -3675,10 +3676,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		req.ContentMD5 = &md5sum
 	}
 	if o.fs.opt.RequesterPays {
-		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+		req.RequestPayer = types.RequestPayerRequester
 	}
 	if o.fs.opt.ServerSideEncryption != "" {
-		req.ServerSideEncryption = &o.fs.opt.ServerSideEncryption
+		req.ServerSideEncryption = types.ServerSideEncryption(o.fs.opt.ServerSideEncryption)
 	}
 	if o.fs.opt.SSECustomerAlgorithm != "" {
 		req.SSECustomerAlgorithm = &o.fs.opt.SSECustomerAlgorithm
@@ -3693,7 +3694,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		req.SSEKMSKeyId = &o.fs.opt.SSEKMSKeyID
 	}
 	if o.fs.opt.StorageClass != "" {
-		req.StorageClass = &o.fs.opt.StorageClass
+		req.StorageClass = types.StorageClass(o.fs.opt.StorageClass)
 	}
 	// Apply upload options
 	for _, option := range options {
@@ -3718,7 +3719,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			const amzMetaPrefix = "x-amz-meta-"
 			if strings.HasPrefix(lowerKey, amzMetaPrefix) {
 				metaKey := lowerKey[len(amzMetaPrefix):]
-				req.Metadata[metaKey] = aws.String(value)
+				req.Metadata[metaKey] = value
 			} else {
 				fs.Errorf(o, "Don't know how to set key %q on upload", key)
 			}
@@ -3734,19 +3735,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	} else {
 
 		// Create the request
-		putObj, _ := o.fs.c.PutObjectRequest(&req)
-
 		// Sign it so we can upload using a presigned request.
 		//
 		// Note the SDK doesn't currently support streaming to
 		// PutObject so we'll use this work-around.
-		url, headers, err := putObj.PresignRequest(15 * time.Minute)
+		signedPut, err := o.fs.presigner.PresignPutObject(ctx, &req, s3.WithPresignExpires(15*time.Minute))
 		if err != nil {
 			return fmt.Errorf("s3 upload: sign request: %w", err)
-		}
-
-		if o.fs.opt.V2Auth && headers == nil {
-			headers = putObj.HTTPRequest.Header
 		}
 
 		// Set request to nil if empty so as not to make chunked encoding
@@ -3755,13 +3750,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 
 		// create the vanilla http request
-		httpReq, err := http.NewRequestWithContext(ctx, "PUT", url, in)
+		httpReq, err := http.NewRequestWithContext(ctx, "PUT", signedPut.URL, in)
 		if err != nil {
 			return fmt.Errorf("s3 upload: new request: %w", err)
 		}
 
 		// set the headers we signed and the length
-		httpReq.Header = headers
+		httpReq.Header = signedPut.SignedHeader
 		httpReq.ContentLength = size
 
 		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
@@ -3793,8 +3788,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		o.bytes = size
 		o.lastModified = time.Now()
 		o.meta = req.Metadata
-		o.mimeType = aws.StringValue(req.ContentType)
-		o.storageClass = aws.StringValue(req.StorageClass)
+		o.mimeType = *req.ContentType
+		o.storageClass = string(req.StorageClass)
 		// If we have done a single part PUT request then we can read these
 		if resp != nil {
 			if date, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
@@ -3819,7 +3814,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		Key:    &bucketPath,
 	}
 	if o.fs.opt.RequesterPays {
-		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+		req.RequestPayer = types.RequestPayerRequester
 	}
 	err := o.fs.pacer.Call(func() (bool, error) {
 		_, err := o.fs.c.DeleteObject(ctx, &req)
@@ -3844,8 +3839,8 @@ func (o *Object) SetTier(tier string) (err error) {
 	tier = strings.ToUpper(tier)
 	bucket, bucketPath := o.split()
 	req := s3.CopyObjectInput{
-		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
-		StorageClass:      aws.String(tier),
+		MetadataDirective: types.MetadataDirectiveCopy,
+		StorageClass:      types.StorageClass(tier),
 	}
 	err = o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
 	if err != nil {
@@ -3858,7 +3853,7 @@ func (o *Object) SetTier(tier string) (err error) {
 // GetTier returns storage class as string
 func (o *Object) GetTier() string {
 	if o.storageClass == "" {
-		return "STANDARD"
+		return string(types.StorageClassStandard)
 	}
 	return o.storageClass
 }
