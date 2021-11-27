@@ -18,7 +18,6 @@ require (
 	github.com/anacrolix/dms v1.3.0
 	github.com/artyom/mtab v0.0.0-20141107123140-74b6fd01d416
 	github.com/atotto/clipboard v0.1.4
-	github.com/aws/aws-sdk-go v1.42.1
 	github.com/billziss-gh/cgofuse v1.5.0
 	github.com/buengese/sgzip v0.1.1
 	github.com/colinmarc/hdfs/v2 v2.2.0
@@ -81,6 +80,10 @@ require (
 	github.com/Azure/go-autorest/tracing v0.6.0 // indirect
 	github.com/Microsoft/go-winio v0.5.1 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
+	github.com/aws/aws-sdk-go-v2 v1.11.1 // indirect
+	github.com/aws/aws-sdk-go-v2/config v1.10.2 // indirect
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.19.1 // indirect
+	github.com/aws/smithy-go v1.9.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce // indirect
 	github.com/calebcase/tmpfile v1.0.3 // indirect

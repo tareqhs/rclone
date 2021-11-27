@@ -22,17 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/corehandlers"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
-	"github.com/aws/aws-sdk-go/aws/defaults"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/ncw/swift/v2"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -1580,7 +1574,7 @@ type Options struct {
 	V2Auth                bool                 `config:"v2_auth"`
 	UseAccelerateEndpoint bool                 `config:"use_accelerate_endpoint"`
 	LeavePartsOnError     bool                 `config:"leave_parts_on_error"`
-	ListChunk             int64                `config:"list_chunk"`
+	ListChunk             int32                `config:"list_chunk"`
 	ListVersion           int                  `config:"list_version"`
 	ListURLEncode         fs.Tristate          `config:"list_url_encode"`
 	NoCheckBucket         bool                 `config:"no_check_bucket"`
@@ -1595,22 +1589,21 @@ type Options struct {
 
 // Fs represents a remote s3 server
 type Fs struct {
-	name          string           // the name of the remote
-	root          string           // root of the bucket - ignore all objects above this
-	opt           Options          // parsed options
-	ci            *fs.ConfigInfo   // global config
-	ctx           context.Context  // global context for reading config
-	features      *fs.Features     // optional features
-	c             *s3.S3           // the connection to the s3 server
-	ses           *session.Session // the s3 session
-	rootBucket    string           // bucket part of root (if any)
-	rootDirectory string           // directory part of root (if any)
-	cache         *bucket.Cache    // cache for bucket creation status
-	pacer         *fs.Pacer        // To pace the API calls
-	srv           *http.Client     // a plain http client
-	srvRest       *rest.Client     // the rest connection to the server
-	pool          *pool.Pool       // memory pool
-	etagIsNotMD5  bool             // if set ETags are not MD5s
+	name          string          // the name of the remote
+	root          string          // root of the bucket - ignore all objects above this
+	opt           Options         // parsed options
+	ci            *fs.ConfigInfo  // global config
+	ctx           context.Context // global context for reading config
+	features      *fs.Features    // optional features
+	c             *s3.Client      // the connection to the s3 server
+	rootBucket    string          // bucket part of root (if any)
+	rootDirectory string          // directory part of root (if any)
+	cache         *bucket.Cache   // cache for bucket creation status
+	pacer         *fs.Pacer       // To pace the API calls
+	srv           *http.Client    // a plain http client
+	srvRest       *rest.Client    // the rest connection to the server
+	pool          *pool.Pool      // memory pool
+	etagIsNotMD5  bool            // if set ETags are not MD5s
 }
 
 // Object describes a s3 object
@@ -1672,10 +1665,12 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
+	// https://github.com/aws/aws-sdk-go-v2/blob/main/CHANGELOG.md#error-handling
 	// If this is an awserr object, try and extract more useful information to determine if we should retry
-	if awsError, ok := err.(awserr.Error); ok {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
 		// Simple case, check the original embedded error in case it's generically retryable
-		if fserrors.ShouldRetry(awsError.OrigErr()) {
+		if fserrors.ShouldRetry(apiErr) {
 			return true, err
 		}
 		// Failing that, if it's a RequestFailure it's probably got an http status code we can check
@@ -1734,10 +1729,10 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 }
 
 // s3Connection makes a connection to s3
-func s3Connection(ctx context.Context, opt *Options, client *http.Client) (*s3.S3, *session.Session, error) {
+func s3Connection(ctx context.Context, opt *Options, client *http.Client) (*s3.Client, *session.Session, error) {
 	ci := fs.GetConfig(ctx)
 	// Make the auth
-	v := credentials.Value{
+	v := aws.Credentials{
 		AccessKeyID:     opt.AccessKeyID,
 		SecretAccessKey: opt.SecretAccessKey,
 		SessionToken:    opt.SessionToken,
@@ -1755,7 +1750,7 @@ func s3Connection(ctx context.Context, opt *Options, client *http.Client) (*s3.S
 	}
 
 	// first provider to supply a credential set "wins"
-	providers := []credentials.Provider{
+	providers := []aws.CredentialsProvider{
 		// use static credentials if they're present (checked by provider)
 		&credentials.StaticProvider{Value: v},
 
@@ -2021,7 +2016,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ci:      ci,
 		ctx:     ctx,
 		c:       c,
-		ses:     ses,
 		pacer:   pc,
 		cache:   bucket.NewCache(),
 		srv:     srv,
@@ -2074,7 +2068,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // Return an Object from a path
 //
 //If it can't be found it returns the error ErrorObjectNotFound.
-func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *s3.Object) (fs.Object, error) {
+func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *types.Object) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -2087,9 +2081,9 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *s3.Obje
 		} else {
 			o.lastModified = *info.LastModified
 		}
-		o.setMD5FromEtag(aws.StringValue(info.ETag))
-		o.bytes = aws.Int64Value(info.Size)
-		o.storageClass = aws.StringValue(info.StorageClass)
+		o.setMD5FromEtag(*info.ETag)
+		o.bytes = info.Size
+		o.storageClass = string(info.StorageClass)
 	} else if !o.fs.opt.NoHeadObject {
 		err := o.readMetaData(ctx) // reads info and meta, returning an error
 		if err != nil {
@@ -2113,7 +2107,7 @@ func (f *Fs) getBucketLocation(ctx context.Context, bucket string) (string, erro
 	var resp *s3.GetBucketLocationOutput
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.c.GetBucketLocation(&req)
+		resp, err = f.c.GetBucketLocation(ctx, &req)
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -2144,14 +2138,13 @@ func (f *Fs) updateRegionForBucket(ctx context.Context, bucket string) error {
 		return fmt.Errorf("creating new session failed: %w", err)
 	}
 	f.c = c
-	f.ses = ses
 
 	fs.Logf(f, "Switched region to %q from %q", region, oldRegion)
 	return nil
 }
 
 // listFn is called from list to handle an object.
-type listFn func(remote string, object *s3.Object, isDirectory bool) error
+type listFn func(remote string, object *types.Object, isDirectory bool) error
 
 // list lists the objects into the function supplied from
 // the bucket and directory supplied.  The remote has prefix
@@ -2195,7 +2188,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 			ContinuationToken: continuationToken,
 			Delimiter:         &delimiter,
 			Prefix:            &directory,
-			MaxKeys:           &f.opt.ListChunk,
+			MaxKeys:           f.opt.ListChunk,
 			StartAfter:        startAfter,
 		}
 		if urlEncodeListings {
@@ -2216,7 +2209,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 					reqv1.Marker = startAfter
 				}
 				var respv1 *s3.ListObjectsOutput
-				respv1, err = f.c.ListObjectsWithContext(ctx, &reqv1)
+				respv1, err = f.c.ListObjects(ctx, &reqv1)
 				if err == nil && respv1 != nil {
 					// convert v1 resp into v2 resp
 					resp = new(s3.ListObjectsV2Output)
@@ -2224,7 +2217,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 					resp.NextContinuationToken = respv1.NextMarker
 				}
 			} else {
-				resp, err = f.c.ListObjectsV2WithContext(ctx, &req)
+				resp, err = f.c.ListObjectsV2(ctx, &req)
 			}
 			if err != nil && !urlEncodeListings {
 				if awsErr, ok := err.(awserr.RequestFailure); ok {
@@ -2286,7 +2279,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 				if strings.HasSuffix(remote, "/") {
 					remote = remote[:len(remote)-1]
 				}
-				err = fn(remote, &s3.Object{Key: &remote}, true)
+				err = fn(remote, &types.Object{Key: &remote}, true)
 				if err != nil {
 					return err
 				}
@@ -2345,7 +2338,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 }
 
 // Convert a list item into a DirEntry
-func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *s3.Object, isDirectory bool) (fs.DirEntry, error) {
+func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *types.Object, isDirectory bool) (fs.DirEntry, error) {
 	if isDirectory {
 		size := int64(0)
 		if object.Size != nil {
@@ -2364,7 +2357,7 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *s3.Objec
 // listDir lists files and directories to out
 func (f *Fs) listDir(ctx context.Context, bucket, directory, prefix string, addBucket bool) (entries fs.DirEntries, err error) {
 	// List the objects and directories
-	err = f.list(ctx, bucket, directory, prefix, addBucket, false, func(remote string, object *s3.Object, isDirectory bool) error {
+	err = f.list(ctx, bucket, directory, prefix, addBucket, false, func(remote string, object *types.Object, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(ctx, remote, object, isDirectory)
 		if err != nil {
 			return err
@@ -2387,7 +2380,7 @@ func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error)
 	req := s3.ListBucketsInput{}
 	var resp *s3.ListBucketsOutput
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.c.ListBucketsWithContext(ctx, &req)
+		resp, err = f.c.ListBuckets(ctx, &req)
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -2442,7 +2435,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	bucket, directory := f.split(dir)
 	list := walk.NewListRHelper(callback)
 	listR := func(bucket, directory, prefix string, addBucket bool) error {
-		return f.list(ctx, bucket, directory, prefix, addBucket, true, func(remote string, object *s3.Object, isDirectory bool) error {
+		return f.list(ctx, bucket, directory, prefix, addBucket, true, func(remote string, object *types.Object, isDirectory bool) error {
 			entry, err := f.itemToDirEntry(ctx, remote, object, isDirectory)
 			if err != nil {
 				return err
@@ -2502,7 +2495,7 @@ func (f *Fs) bucketExists(ctx context.Context, bucket string) (bool, error) {
 		Bucket: &bucket,
 	}
 	err := f.pacer.Call(func() (bool, error) {
-		_, err := f.c.HeadBucketWithContext(ctx, &req)
+		_, err := f.c.HeadBucket(ctx, &req)
 		return f.shouldRetry(ctx, err)
 	})
 	if err == nil {
@@ -2538,7 +2531,7 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) error {
 			}
 		}
 		err := f.pacer.Call(func() (bool, error) {
-			_, err := f.c.CreateBucketWithContext(ctx, &req)
+			_, err := f.c.CreateBucket(ctx, &req)
 			return f.shouldRetry(ctx, err)
 		})
 		if err == nil {
@@ -2568,7 +2561,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 			Bucket: &bucket,
 		}
 		err := f.pacer.Call(func() (bool, error) {
-			_, err := f.c.DeleteBucketWithContext(ctx, &req)
+			_, err := f.c.DeleteBucket(ctx, &req)
 			return f.shouldRetry(ctx, err)
 		})
 		if err == nil {
@@ -2628,7 +2621,7 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 		return f.copyMultipart(ctx, req, dstBucket, dstPath, srcBucket, srcPath, src)
 	}
 	return f.pacer.Call(func() (bool, error) {
-		_, err := f.c.CopyObjectWithContext(ctx, req)
+		_, err := f.c.CopyObject(ctx, req)
 		return f.shouldRetry(ctx, err)
 	})
 }
@@ -2672,7 +2665,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 	var cout *s3.CreateMultipartUploadOutput
 	if err := f.pacer.Call(func() (bool, error) {
 		var err error
-		cout, err = f.c.CreateMultipartUploadWithContext(ctx, req)
+		cout, err = f.c.CreateMultipartUpload(ctx, req)
 		return f.shouldRetry(ctx, err)
 	}); err != nil {
 		return err
@@ -2683,7 +2676,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 		// Try to abort the upload, but ignore the error.
 		fs.Debugf(src, "Cancelling multipart copy")
 		_ = f.pacer.Call(func() (bool, error) {
-			_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
+			_, err := f.c.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 				Bucket:       &dstBucket,
 				Key:          &dstPath,
 				UploadId:     uid,
@@ -2710,7 +2703,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 			uploadPartReq.PartNumber = &partNum
 			uploadPartReq.UploadId = uid
 			uploadPartReq.CopySourceRange = aws.String(calculateRange(partSize, partNum-1, numParts, srcSize))
-			uout, err := f.c.UploadPartCopyWithContext(ctx, uploadPartReq)
+			uout, err := f.c.UploadPartCopy(ctx, uploadPartReq)
 			if err != nil {
 				return f.shouldRetry(ctx, err)
 			}
@@ -2725,7 +2718,7 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 	}
 
 	return f.pacer.Call(func() (bool, error) {
-		_, err := f.c.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
+		_, err := f.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: &dstBucket,
 			Key:    &dstPath,
 			MultipartUpload: &s3.CompletedMultipartUpload{
@@ -3005,7 +2998,7 @@ func (f *Fs) listMultipartUploads(ctx context.Context, bucket, key string) (uplo
 	for {
 		req := s3.ListMultipartUploadsInput{
 			Bucket:         &bucket,
-			MaxUploads:     &f.opt.ListChunk,
+			MaxUploads:     f.opt.ListChunk,
 			KeyMarker:      keyMarker,
 			UploadIdMarker: uploadIDMarker,
 			Prefix:         &key,
@@ -3187,7 +3180,7 @@ func (o *Object) headObject(ctx context.Context) (resp *s3.HeadObjectOutput, err
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		var err error
-		resp, err = o.fs.c.HeadObjectWithContext(ctx, &req)
+		resp, err = o.fs.c.HeadObject(ctx, &req)
 		return o.fs.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -3484,7 +3477,7 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 	var cout *s3.CreateMultipartUploadOutput
 	err = f.pacer.Call(func() (bool, error) {
 		var err error
-		cout, err = f.c.CreateMultipartUploadWithContext(ctx, &mReq)
+		cout, err = f.c.CreateMultipartUpload(ctx, &mReq)
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -3498,7 +3491,7 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 		}
 		fs.Debugf(o, "Cancelling multipart upload")
 		errCancel := f.pacer.Call(func() (bool, error) {
-			_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
+			_, err := f.c.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 				Bucket:       req.Bucket,
 				Key:          req.Key,
 				UploadId:     uid,
@@ -3577,7 +3570,7 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 					SSECustomerKey:       req.SSECustomerKey,
 					SSECustomerKeyMD5:    req.SSECustomerKeyMD5,
 				}
-				uout, err := f.c.UploadPartWithContext(gCtx, uploadPartReq)
+				uout, err := f.c.UploadPart(gCtx, uploadPartReq)
 				if err != nil {
 					if partNum <= int64(concurrency) {
 						return f.shouldRetry(ctx, err)
@@ -3611,7 +3604,7 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 	})
 
 	err = f.pacer.Call(func() (bool, error) {
-		_, err := f.c.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
+		_, err := f.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: req.Bucket,
 			Key:    req.Key,
 			MultipartUpload: &s3.CompletedMultipartUpload{
@@ -3829,7 +3822,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		req.RequestPayer = aws.String(s3.RequestPayerRequester)
 	}
 	err := o.fs.pacer.Call(func() (bool, error) {
-		_, err := o.fs.c.DeleteObjectWithContext(ctx, &req)
+		_, err := o.fs.c.DeleteObject(ctx, &req)
 		return o.fs.shouldRetry(ctx, err)
 	})
 	return err
