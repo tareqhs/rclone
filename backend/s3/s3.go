@@ -3726,7 +3726,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
-	var resp *http.Response // response from PUT
+	var resp *s3.PutObjectOutput
 	if multipart {
 		err = o.uploadMultipart(ctx, &req, size, in)
 		if err != nil {
@@ -3734,50 +3734,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	} else {
 
-		// Create the request
-		// Sign it so we can upload using a presigned request.
-		//
-		// Note the SDK doesn't currently support streaming to
-		// PutObject so we'll use this work-around.
-		signedPut, err := o.fs.presigner.PresignPutObject(ctx, &req, s3.WithPresignExpires(15*time.Minute))
-		if err != nil {
-			return fmt.Errorf("s3 upload: sign request: %w", err)
-		}
-
 		// Set request to nil if empty so as not to make chunked encoding
 		if size == 0 {
 			in = nil
 		}
+		req.Body = in
 
-		// create the vanilla http request
-		httpReq, err := http.NewRequestWithContext(ctx, "PUT", signedPut.URL, in)
+		resp, err = o.fs.c.PutObject(ctx, &req)
 		if err != nil {
-			return fmt.Errorf("s3 upload: new request: %w", err)
+			fmt.Errorf("s3 upload: %w", err)
 		}
 
-		// set the headers we signed and the length
-		httpReq.Header = signedPut.SignedHeader
-		httpReq.ContentLength = size
-
-		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-			var err error
-			resp, err = o.fs.srv.Do(httpReq)
-			if err != nil {
-				return o.fs.shouldRetry(ctx, err)
-			}
-			body, err := rest.ReadBody(resp)
-			if err != nil {
-				return o.fs.shouldRetry(ctx, err)
-			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 299 {
-				return false, nil
-			}
-			err = fmt.Errorf("s3 upload: %s: %s", resp.Status, body)
-			return fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
-		})
-		if err != nil {
-			return err
-		}
 	}
 
 	// User requested we don't HEAD the object after uploading it
@@ -3792,10 +3759,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		o.storageClass = string(req.StorageClass)
 		// If we have done a single part PUT request then we can read these
 		if resp != nil {
-			if date, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
-				o.lastModified = date
-			}
-			o.setMD5FromEtag(resp.Header.Get("Etag"))
+			o.setMD5FromEtag(*resp.ETag)
 		}
 		return nil
 	}
